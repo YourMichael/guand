@@ -1,0 +1,121 @@
+name: 打包安卓 App
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 检查游戏文件
+        run: |
+          echo "仓库里的文件："
+          find . -path ./.git -prune -o -type f -print | sort
+          mkdir -p www
+          if [ ! -f www/index.html ]; then
+            CAND=$(find . -path ./.git -prune -o -path ./www -prune -o -name "*.html" -type f -print | head -n 1)
+            if [ -z "$CAND" ]; then
+              echo "::error::没有找到游戏网页。请把游戏文件上传到 www/index.html"
+              exit 1
+            fi
+            echo "使用 $CAND 作为游戏页面"
+            cp "$CAND" www/index.html
+          fi
+
+      - name: 生成 App 配置
+        run: |
+          rm -f package-lock.json
+          cat > package.json << 'EOF'
+          {
+            "name": "qmeng-guandan",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "8.5.3",
+              "@capacitor/cli": "8.5.3",
+              "@capacitor/core": "8.5.3"
+            }
+          }
+          EOF
+          cat > capacitor.config.json << 'EOF'
+          {
+            "appId": "com.qmeng.guandan",
+            "appName": "Q萌掼蛋",
+            "webDir": "www",
+            "android": { "backgroundColor": "#1F9C86" }
+          }
+          EOF
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 安装 Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: 内置字体（失败也不影响打包）
+        run: |
+          if [ -f scripts/bundle_fonts.py ]; then python3 scripts/bundle_fonts.py; else echo "没有字体脚本，跳过"; fi
+
+      - name: 安装 Capacitor
+        run: npm install --no-audit --no-fund
+
+      - name: 生成安卓工程
+        run: npx cap add android
+
+      - name: 换上图标和启动图
+        run: |
+          if [ -d resources/android/res ]; then
+            rm -f android/app/src/main/res/drawable-v24/ic_launcher_foreground.xml
+            cp -r resources/android/res/. android/app/src/main/res/
+          else
+            echo "没有找到图标文件夹，使用默认图标"
+          fi
+
+      - name: 同步网页到安卓工程
+        run: npx cap sync android
+
+      - name: 使用固定签名（以后升级可直接覆盖安装）
+        run: |
+          if [ -f resources/debug.keystore ]; then
+            mkdir -p ~/.android
+            cp resources/debug.keystore ~/.android/debug.keystore
+          else
+            echo "没有找到签名文件，使用临时签名"
+          fi
+
+      - name: 接受 Android SDK 许可
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: 编译 APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk ../QMengGuandan.apk
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: QMengGuandan-apk
+          path: QMengGuandan.apk
+
+      - name: 发布到 Releases（手机可直接下载）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Q萌掼蛋 v1.0.${{ github.run_number }}
+          files: QMengGuandan.apk
