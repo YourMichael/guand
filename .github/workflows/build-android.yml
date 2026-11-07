@@ -15,15 +15,24 @@ jobs:
       - name: 取代码
         uses: actions/checkout@v4
 
-      - name: 检查游戏文件
+      - name: 整理文件（自动找游戏网页和图标）
         run: |
           echo "仓库里的文件："
           find . -path ./.git -prune -o -type f -print | sort
           mkdir -p www
+          # 图标和启动图：没有 resources 文件夹时，从仓库里的 zip 包取出来
+          ZIP=$(find . -maxdepth 1 -name "*.zip" -type f | head -n 1)
+          if [ ! -d resources ] && [ -n "$ZIP" ]; then
+            echo "从 $ZIP 取出图标"
+            unzip -o -q "$ZIP" "resources/*" -d . || echo "zip 里没有图标"
+          fi
+          # 游戏网页：优先 www/index.html，否则在仓库里找游戏文件（自动跳过隐私政策）
           if [ ! -f www/index.html ]; then
-            CAND=$(find . -path ./.git -prune -o -path ./www -prune -o -name "*.html" -type f -print | head -n 1)
+            CAND=$(find . -path ./.git -prune -o -path ./www -prune -o -name "*.html" -type f -exec grep -l "window.APP_MODE=true" {} + | head -n 1)
+            [ -z "$CAND" ] && CAND=$(find . -path ./.git -prune -o -path ./www -prune -o -name "*.html" -type f -exec grep -l "makeDeck" {} + | head -n 1)
+
             if [ -z "$CAND" ]; then
-              echo "::error::没有找到游戏网页。请把游戏文件上传到 www/index.html"
+              echo "::error::没有找到游戏网页，请上传游戏的 index.html"
               exit 1
             fi
             echo "使用 $CAND 作为游戏页面"
@@ -41,7 +50,9 @@ jobs:
             "dependencies": {
               "@capacitor/android": "8.5.3",
               "@capacitor/cli": "8.5.3",
-              "@capacitor/core": "8.5.3"
+              "@capacitor/core": "8.5.3",
+              "@fontsource/baloo-2": "5.3.0",
+              "@fontsource/zcool-kuaile": "5.3.0"
             }
           }
           EOF
@@ -52,6 +63,7 @@ jobs:
             "webDir": "www",
             "android": { "backgroundColor": "#1F9C86" }
           }
+
           EOF
 
       - name: 安装 Node.js
@@ -65,21 +77,59 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - name: 内置字体（失败也不影响打包）
-        run: |
-          if [ -f scripts/bundle_fonts.py ]; then python3 scripts/bundle_fonts.py; else echo "没有字体脚本，跳过"; fi
-
       - name: 安装 Capacitor
         run: npm install --no-audit --no-fund
 
+      - name: 内置字体（失败也不影响打包）
+        run: |
+          python3 - << 'PY'
+          import os, re, shutil
+
+          HTML = "www/index.html"
+          OUT = "www/fonts"
+          NM = "node_modules/@fontsource"
+          SOURCES = [("zcool-kuaile", "index.css"), ("baloo-2", "latin-700.css"), ("baloo-2", "latin-800.css")]
+          LINK = r'<link href="https://fonts\.googleapis\.com/css2[^"]+" rel="stylesheet">'
+
+          html = open(HTML, encoding="utf-8").read()
+          try:
+              os.makedirs(OUT, exist_ok=True)
+              parts, n = [], 0
+              for pkg, css_name in SOURCES:
+
+                  css = open(os.path.join(NM, pkg, css_name), encoding="utf-8").read()
+                  css = re.sub(r",\s*url\(\./files/[^)]+\.woff\)\s*format\('woff'\)", "", css)
+                  for f in sorted(set(re.findall(r"url\(\./files/([^)]+\.woff2)\)", css))):
+                      shutil.copy(os.path.join(NM, pkg, "files", f), os.path.join(OUT, f))
+                      n += 1
+                  parts.append(css.replace("url(./files/", "url("))
+              open(os.path.join(OUT, "fonts.css"), "w", encoding="utf-8").write("\n".join(parts))
+              html, k = re.subn(LINK, '<link href="fonts/fonts.css" rel="stylesheet">', html)
+              if not k:
+                  html = html.replace("</head>", '<link href="fonts/fonts.css" rel="stylesheet">\n</head>', 1)
+              print(f"字体已内置，共 {n} 个文件")
+          except Exception as e:
+              print("字体内置失败，改用手机自带字体：", e)
+              html = re.sub(LINK + r"\s*", "", html)
+          html = re.sub(r'<link rel="preconnect"[^>]*>\s*', "", html)
+          open(HTML, "w", encoding="utf-8").write(html)
+          PY
+
       - name: 生成安卓工程
         run: npx cap add android
+
+      - name: 设置版本号（每次打包自动加 1）
+        run: |
+          sed -i "s/versionCode 1$/versionCode ${{ github.run_number }}/" android/app/build.gradle
+          sed -i "s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" android/app/build.gradle
+          grep -n "versionCode\|versionName" android/app/build.gradle
 
       - name: 换上图标和启动图
         run: |
           if [ -d resources/android/res ]; then
             rm -f android/app/src/main/res/drawable-v24/ic_launcher_foreground.xml
             cp -r resources/android/res/. android/app/src/main/res/
+
           else
             echo "没有找到图标文件夹，使用默认图标"
           fi
@@ -100,12 +150,29 @@ jobs:
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
-      - name: 编译 APK
+      - name: 编译 APK（有密钥就出正式签名版）
         working-directory: android
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk ../QMengGuandan.apk
+          if [ -n "$KS_B64" ]; then
+            echo "使用正式签名"
+            echo "$KS_B64" | base64 -d > release.keystore
+            ./gradlew assembleRelease --no-daemon
+
+            BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+            "$BT/zipalign" -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+            "$BT/apksigner" sign --ks release.keystore --ks-pass env:KS_PASS --key-pass env:KS_PASS --ks-key-alias "$KEY_ALIAS" --out ../QMengGuandan.apk aligned.apk
+            "$BT/apksigner" verify --print-certs ../QMengGuandan.apk
+            rm -f release.keystore
+          else
+            echo "::warning::没有设置签名密钥，本次生成的是调试版，只能自己安装，不能上架商店"
+            ./gradlew assembleDebug --no-daemon
+            cp app/build/outputs/apk/debug/app-debug.apk ../QMengGuandan.apk
+          fi
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
